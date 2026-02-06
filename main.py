@@ -1,268 +1,175 @@
-from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, JSONResponse
-from pathlib import Path
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from pydantic import BaseModel, Field
+from fastapi.openapi.docs import get_swagger_ui_html
+from sqlalchemy import create_engine, Column, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 import subprocess
-from threading import Thread
+import time
+import os
+import requests
+from datetime import datetime
+import uuid
 
-app = FastAPI(title="Git Dashboard")
+# -----------------------------
+# Database setup
+# -----------------------------
+Base = declarative_base()
+DB_FILE = "config.db"
+engine = create_engine(f"sqlite:///{DB_FILE}", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
 
-# --- Global cache to store repo info ---
-git_cache = {}
+class Config(Base):
+    __tablename__ = "config"
+    id = Column(Integer, primary_key=True)
+    swap_wait_seconds = Column(Integer, default=5)
 
-# --- Utility functions ---
-def run_git(cmd, repo_path: Path):
+Base.metadata.create_all(engine)
+
+# Ensure at least one row for defaults
+with SessionLocal() as session:
+    if session.query(Config).count() == 0:
+        session.add(Config(swap_wait_seconds=5))
+        session.commit()
+
+# -----------------------------
+# FastAPI setup
+# -----------------------------
+app = FastAPI(
+    title="Docker Deployment Webhook",
+    description=(
+        "A webhook endpoint for zero-downtime Docker container deployments. "
+        "Only images matching a configured whitelist are allowed."
+    ),
+    version="0.0.3"
+)
+
+@app.get("/", include_in_schema=False)
+async def custom_swagger_ui():
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="OCR API Docs")
+
+# -----------------------------
+# Configuration
+# -----------------------------
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "supersecret")  # still required
+
+ALLOWED_IMAGE_PREFIXES = [
+    "ghcr.io/leanderziehm/",
+]
+
+NOTIFY_URL = os.environ.get("NOTIFY_URL", "https://notify.leanderziehm.com/notify/me")
+
+# -----------------------------
+# Models
+# -----------------------------
+class WebhookPayload(BaseModel):
+    secret: str = Field(..., description="Webhook secret for authentication")
+    image_url: str = Field(
+        ...,
+        example="ghcr.io/leanderziehm/excalidraw-selfhosted:21e74edf89ab143642401b60efa9f7eca28c8519",
+        description="Full Docker image URL to deploy."
+    )
+
+class WebhookResponse(BaseModel):
+    status: str = Field(..., description="Deployment status message.")
+
+class ConfigResponse(BaseModel):
+    swap_wait_seconds: int = Field(..., description="Seconds to wait before swapping containers.")
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def get_config():
+    with SessionLocal() as session:
+        return session.query(Config).first()
+
+def notify_error(message: str):
+    """Send a POST request to the notification API."""
     try:
-        return subprocess.check_output(
-            ["git"] + cmd,
-            cwd=repo_path,
-            stderr=subprocess.DEVNULL,
-            env={"GIT_TERMINAL_PROMPT": "0"}  # don't prompt
-        ).decode().strip()
-    except subprocess.CalledProcessError:
-        return None
+        requests.post(NOTIFY_URL, json={"text": message}, timeout=5)
+    except Exception as e:
+        print(f"[ERROR] Failed to send notification: {e}")
 
-def get_git_info(repo_path: Path):
-    if not (repo_path / ".git").exists():
-        return None
+def pull_and_swap_container(image_url: str):
+    """Pull Docker image and perform zero-downtime container swap, with error notifications."""
+    container_base_name = image_url.split("/")[-1].split(":")[0]
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    tmp_container = f"{container_base_name}_{timestamp}_{uuid.uuid4().hex[:6]}"
 
-    branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
-    local_commit = run_git(["rev-parse", "HEAD"], repo_path)
-    remote_commit = run_git(["rev-parse", f"origin/{branch}"], repo_path) if branch else None
+    swap_wait_seconds = get_config().swap_wait_seconds
 
-    if not branch or not local_commit:
-        return None
-
-    ahead, behind = 0, 0
-    ahead_behind = run_git(["rev-list", "--left-right", "--count", f"{branch}...origin/{branch}"], repo_path)
-    if ahead_behind:
-        ahead, behind = map(int, ahead_behind.split())
-
-    last_local_commit_date = run_git(["log", "-1", "--format=%ci", branch], repo_path)
-    last_remote_commit_date = run_git(["log", "-1", "--format=%ci", f"origin/{branch}"], repo_path) if remote_commit else None
-
-    return {
-        "name": repo_path.name,
-        "path": str(repo_path.resolve()),
-        "branch": branch,
-        "local_commit": local_commit,
-        "remote_commit": remote_commit,
-        "ahead": ahead,
-        "behind": behind,
-        "last_local_commit_date": last_local_commit_date,
-        "last_remote_commit_date": last_remote_commit_date
-    }
-
-def update_repo_cache(repo_path: Path):
     try:
-        subprocess.run(
-            ["git", "fetch", "--all", "--prune", "--quiet", "--depth=1"],
-            cwd=repo_path,
-            env={"GIT_TERMINAL_PROMPT": "0"}
-        )
-    except Exception:
-        pass
-    info = get_git_info(repo_path)
-    if info:
-        git_cache[repo_path.name] = info
-        return info
-    return {"name": repo_path.name, "error": "Could not fetch repo"}
+        print(f"[INFO] Pulling image: {image_url}")
+        subprocess.run(["podman", "pull", image_url], check=True)
 
+        print(f"[INFO] Starting temporary container: {tmp_container}")
+        subprocess.run([
+            "podman", "run", "-d", "--name", tmp_container,
+            "--restart", "always", "-p", "3000:3000",
+            image_url
+        ], check=True)
 
-# --- Routes ---
-@app.get("/", response_class=HTMLResponse)
-def dashboard():
-    current_dir = Path(__file__).parent
-    parent_dir = current_dir.parent
-    sibling_dirs = [d for d in parent_dir.iterdir() if d.is_dir()]
-    repo_names = [d.name for d in sibling_dirs]
+        print(f"[INFO] Waiting {swap_wait_seconds} seconds for container to stabilize")
+        time.sleep(swap_wait_seconds)
 
-    html = """
-<html>
-<head>
-<title>Git Dashboard</title>
-<style>
-body { font-family: Arial, sans-serif; background-color: #f7f7f7; }
-h1 { color: #333; }
-table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-th { background-color: #4682B4; color: white; }
-tr:nth-child(even) { background-color: #f2f2f2; }
-tr.outdated { background-color: #ffcccc; }
-tr.fetching td, tr.pulling td { opacity: 0.6; }
-button { border: none; padding: 5px 10px; cursor: pointer; border-radius: 4px; color: white; }
-button.fetch { background-color: #4682B4; }
-button.pull { background-color: #e94e77; }
-button:disabled { background-color: #999; cursor: not-allowed; }
-#fetch-all { margin-bottom: 10px; background-color: #5a9bd3; }
-.spinner { display:inline-block; width:16px; height:16px; border:2px solid rgba(0,0,0,0.2); border-top-color:#333; border-radius:50%; animation:spin 0.6s linear infinite; margin-left:5px; vertical-align:middle; }
-@keyframes spin { to { transform: rotate(360deg); } }
-tr.success td { background-color: #ccffcc !important; transition: background 0.5s; }
-tr.error td { background-color: #ff9999 !important; transition: background 0.5s; }
-</style>
-</head>
-<body>
-<h1>Git Dashboard</h1>
-<button id="fetch-all">Fetch All</button>
-<table id="repo-table">
-<tr><th>Actions</th><th>Repo</th><th>Behind</th><th>Branch</th><th>Local Commit</th><th>Remote Commit</th><th>Last Local Commit</th><th>Last Remote Commit</th></tr>
-"""
+        # Stop and remove existing container(s)
+        existing_containers = subprocess.run(
+            ["podman", "ps", "-aq", "-f", f"name={container_base_name}"],
+            capture_output=True, text=True
+        ).stdout.strip().splitlines()
 
-    for name in repo_names:
-        html += f"<tr id='repo-{name}'><td colspan='8'>Loading {name}...</td></tr>"
+        for container_id in existing_containers:
+            print(f"[INFO] Stopping old container: {container_id}")
+            subprocess.run(["podman", "stop", container_id], check=True)
+            subprocess.run(["podman", "rm", container_id], check=True)
 
-    html += "</table>"
+        print(f"[INFO] Renaming {tmp_container} -> {container_base_name}")
+        subprocess.run(["podman", "rename", tmp_container, container_base_name], check=True)
 
-    html += f"""
-<script>
-const repoNames = [{','.join(f'"{n}"' for n in repo_names)}];
+        print("[INFO] Deployment completed successfully!")
 
-function flashRow(row, className, duration=1000) {{
-    row.classList.add(className);
-    setTimeout(() => row.classList.remove(className), duration);
-}}
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Deployment failed for {image_url}: {e}"
+        print(f"[ERROR] {error_msg}")
+        notify_error(error_msg)
 
-function updateRow(row, data) {{
-    row.innerHTML = '';
-    if(data.error) {{
-        const repoName = data.name || "Unknown";
-        console.log(`❌ ${{repoName}} error: ${{data.error}}`);
-        const td = document.createElement('td');
-        td.colSpan = 8;
-        td.textContent = `${{repoName}}: ${{data.error}}`;
-        row.appendChild(td);
-        row.className = 'error';
-        return;
-    }}
+    except Exception as e:
+        error_msg = f"Unexpected error during deployment of {image_url}: {e}"
+        print(f"[ERROR] {error_msg}")
+        notify_error(error_msg)
 
-    row.className = data.behind > 0 ? 'outdated' : '';
+# -----------------------------
+# Webhook endpoint
+# -----------------------------
+@app.post(
+    "/webhook",
+    response_model=WebhookResponse,
+    summary="Deploy Docker image via webhook",
+    description="Accepts a JSON payload with `secret` and `image_url`, deploys it with zero downtime. Only whitelisted images are allowed."
+)
+async def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
+    if payload.secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret.")
 
-    // Actions cell
-    const actionsTd = document.createElement('td');
+    image_url = payload.image_url
+    if not any(image_url.startswith(prefix) for prefix in ALLOWED_IMAGE_PREFIXES):
+        raise HTTPException(status_code=403, detail="Image not allowed by whitelist.")
 
-    const fetchBtn = document.createElement('button');
-    fetchBtn.innerText = 'Fetch';
-    fetchBtn.className = 'fetch';
-    const pullBtn = document.createElement('button');
-    pullBtn.innerText = 'Pull';
-    pullBtn.className = 'pull';
+    background_tasks.add_task(pull_and_swap_container, image_url)
+    return WebhookResponse(status="Deployment started in background.")
 
-    fetchBtn.onclick = async () => {{
-        console.log(`🔄 Fetch clicked for ${{data.name}}`);
-        fetchBtn.disabled = true;
-        pullBtn.disabled = true;
-        row.classList.add('fetching');
-        const spinner = document.createElement('span');
-        spinner.className = 'spinner';
-        actionsTd.appendChild(spinner);
+# -----------------------------
+# Endpoint to get/update swap wait seconds
+# -----------------------------
+@app.get("/config", response_model=ConfigResponse)
+def get_swap_wait():
+    cfg = get_config()
+    return ConfigResponse(swap_wait_seconds=cfg.swap_wait_seconds)
 
-        try {{
-            const res = await fetch('/fetch_repo/' + data.name);
-            const newData = await res.json();
-            updateRow(row, newData);
-            flashRow(row, 'success');
-            console.log(`✅ Fetch completed for ${{data.name}}`);
-        }} catch(err) {{
-            console.error(`❌ Fetch failed for ${{data.name}}`, err);
-            flashRow(row, 'error');
-        }}
-    }};
-
-    pullBtn.onclick = async () => {{
-        console.log(`🔄 Pull clicked for ${{data.name}}`);
-        fetchBtn.disabled = true;
-        pullBtn.disabled = true;
-        row.classList.add('pulling');
-        const spinner = document.createElement('span');
-        spinner.className = 'spinner';
-        actionsTd.appendChild(spinner);
-
-        try {{
-            const res = await fetch('/pull_repo', {{
-                method:'POST',
-                headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-                body: `repo_path=${{encodeURIComponent(data.path)}}`
-            }});
-            const newData = await res.json();
-            updateRow(row, newData);
-            flashRow(row, 'success');
-            console.log(`✅ Pull completed for ${{data.name}}`);
-        }} catch(err) {{
-            console.error(`❌ Pull failed for ${{data.name}}`, err);
-            flashRow(row, 'error');
-        }}
-    }};
-
-    actionsTd.appendChild(fetchBtn);
-    actionsTd.appendChild(pullBtn);
-    row.appendChild(actionsTd);
-
-    // Other columns
-    const cols = [
-        data.name,
-        data.behind,
-        data.branch,
-        data.local_commit.substring(0,7),
-        data.remote_commit ? data.remote_commit.substring(0,7) : 'N/A',
-        data.last_local_commit_date,
-        data.last_remote_commit_date
-    ];
-    for(const col of cols) {{
-        const td = document.createElement('td');
-        td.textContent = col;
-        row.appendChild(td);
-    }}
-}}
-
-async function fetchRepo(repoName) {{
-    const row = document.getElementById('repo-' + repoName);
-    console.log(`Fetching ${{repoName}}...`);
-    row.classList.add('fetching');
-    const res = await fetch('/fetch_repo/' + repoName);
-    const data = await res.json();
-    updateRow(row, data);
-    row.classList.remove('fetching');
-}}
-
-async function fetchAll() {{
-    for(const repo of repoNames) {{
-        fetchRepo(repo);
-    }}
-}}
-
-document.getElementById('fetch-all').onclick = fetchAll;
-repoNames.forEach(fetchRepo);
-</script>
-
-</body>
-</html>
-"""
-    return HTMLResponse(html)
-
-
-@app.get("/fetch_repo/{repo_name}")
-def fetch_repo(repo_name: str):
-    repo_path = Path(__file__).parent.parent / repo_name
-    info = update_repo_cache(repo_path)
-    if not info:
-        return JSONResponse({"name": repo_name, "error": "Cannot fetch"})
-    return JSONResponse(info)
-
-
-@app.post("/pull_repo")
-def pull_repo(repo_path: str = Form(...)):
-    repo = Path(repo_path)
-    if repo.exists() and (repo / ".git").exists():
-        try:
-            subprocess.run(
-                ["git", "pull"],
-                cwd=repo,
-                stderr=subprocess.DEVNULL,
-                env={"GIT_TERMINAL_PROMPT": "0"}
-            )
-        except subprocess.CalledProcessError:
-            return JSONResponse({"name": repo.name, "error": "Pull failed"})
-    info = update_repo_cache(repo)
-    return JSONResponse(info)
-
-
-
+@app.post("/config", response_model=ConfigResponse)
+def set_swap_wait(swap_wait_seconds: int):
+    with SessionLocal() as session:
+        cfg = session.query(Config).first()
+        cfg.swap_wait_seconds = swap_wait_seconds
+        session.commit()
+        return ConfigResponse(swap_wait_seconds=cfg.swap_wait_seconds)
