@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pathlib import Path
 import subprocess
 from threading import Thread
+import uvicorn
 
 app = FastAPI(title="Git Dashboard")
 
@@ -266,3 +267,5 @@ def pull_repo(repo_path: str = Form(...)):
 
 
 
+if __name__ == '__main__':
+    uvicorn.run(app=app, port=9999)
