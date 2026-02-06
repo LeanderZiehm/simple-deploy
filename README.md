@@ -20,7 +20,7 @@ python main.py
 
 or 
 
-# [uv](https://docs.astral.sh/uv/guides/integration/docker/#installing-uv)
+# [uv](https://docs.astral.sh/uv/getting-started/installation/)
 ```
 uv run main.py 
 ```
